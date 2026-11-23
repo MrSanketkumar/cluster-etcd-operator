@@ -26,6 +26,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/staticpod"
 	"github.com/openshift/library-go/pkg/operator/staticpod/controller/common"
+	"github.com/openshift/library-go/pkg/operator/staticpod/controller/guard"
 	"github.com/openshift/library-go/pkg/operator/staticpod/controller/installer"
 	"github.com/openshift/library-go/pkg/operator/staticpod/controller/revision"
 	"github.com/openshift/library-go/pkg/operator/staticresourcecontroller"
@@ -65,6 +66,7 @@ import (
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/etcdcertsigner"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/etcdendpointscontroller"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/etcdmemberscontroller"
+	"github.com/openshift/cluster-etcd-operator/pkg/operator/guardretirement"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/health"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/machinedeletionhooks"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/metriccontroller"
@@ -342,11 +344,6 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 		WithOperandPodLabelSelector(labels.Set{"etcd": "true"}.AsSelector())
 	if hasArbiterTopology {
 		staticPodBuilderControllers = staticPodBuilderControllers.WithExtraNodeSelector(arbiterNodeLabelSelector)
-	}
-
-	staticPodControllers, err := staticPodBuilderControllers.ToControllers()
-	if err != nil {
-		return err
 	}
 
 	fsyncMetricController := metriccontroller.NewFSyncController(
@@ -628,6 +625,9 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 
 	if machineAPIEnabled || machineAPIAvailable {
 		klog.Infof("Detected available machine API, starting vertical scaling related controllers and informers...")
+		staticPodBuilderControllers = staticPodBuilderControllers.WithGuardNodeFilter(
+			guard.NewEtcdRetirementNodeFilter(kubeClient.CoreV1()),
+		)
 		clusterMemberControllerInformers = append(clusterMemberControllerInformers, masterMachineInformer)
 		clusterMemberRemovalController := clustermemberremovalcontroller.NewClusterMemberRemovalController(
 			AlivenessChecker,
@@ -659,6 +659,14 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 		go masterMachineInformer.Run(ctx.Done())
 		go clusterMemberRemovalController.Run(ctx, 1)
 		go machineDeletionHooksController.Run(ctx, 1)
+		go guardretirement.NewController(operatorClient, etcdClient, machineClient, kubeClient,
+			masterMachineInformer, controlPlaneNodeInformer, masterMachineLabelSelector,
+			controlPlaneNodeLabelSelector, controllerContext.EventRecorder).Run(ctx, 1)
+	}
+
+	staticPodControllers, err := staticPodBuilderControllers.ToControllers()
+	if err != nil {
+		return err
 	}
 
 	// clusterMemberController uses the machineAPI component, but can run entirely without it
